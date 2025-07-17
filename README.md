@@ -34,8 +34,8 @@ _Abbildung: Generierte RTL-Skizze_
 ```
 .
 ├── src/
-│   ├── montgomery_mult.vhd       # Hauptmodul
-│   └── montgomery_mult_tb.vhd    # Testbench (WIDTH=8)
+│   ├── r2mm.vhd                  # Hauptmodul
+│   └── tb_r2mm.vhd               # Testbench (WIDTH=8)
 ├── doc/
 │   ├── r2mm_dev_util.png         # Auslastungsbericht
 │   ├── r2mm_dev_proj_status.png  # Projektstatus
