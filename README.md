@@ -1,3 +1,5 @@
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 ![R2MM Performance Test](doc/r2mm_test.png)
 
 # R2MM Montgomery Multiplication
