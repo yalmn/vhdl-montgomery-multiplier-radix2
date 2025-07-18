@@ -1,216 +1,137 @@
-----------------------------------------------------------------------------------
--- Company:        
--- Engineer:       Halil Yalman (halil@yalman.io)
--- 
--- Create Date:    14:17:44 07/17/2025 
--- Design Name:    Montgomery Multiplier
--- Module Name:    montgomery_mult - rtl 
--- Project Name:   R2MM Montgomery Multiplication
--- Target Devices: Xilinx Spartan-3E (xc3s500e-5-vq100)
--- Tool versions:  ISE 14.7
--- Description:    
---   Hardware-Implementation der Montgomery-Multiplikation für Kryptographie-Anwendungen.
---   Berechnet: S = (A * B * R^-1) mod N, wobei R = 2^WIDTH
---   Unterstützt konfigurierbare Bitbreiten bis 1024 Bit.
---
--- Dependencies:   IEEE.STD_LOGIC_1164, IEEE.NUMERIC_STD
---
--- Revision: 
--- Revision 0.01 - File Created
--- Revision 0.02 - Added read_result functionality for result access control
--- Additional Comments: 
---   - Implementiert den Standard-Montgomery-Algorithmus in Hardware
---   - Zustandsmaschine: IDLE -> CALC -> REDUCE -> FINISHED
---   - done_o Signal wird nach erfolgreicher Berechnung gesetzt
---   - read_result Signal resettet done_o nach Ergebnis-Zugriff
---
-----------------------------------------------------------------------------------
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.NUMERIC_STD.ALL;
 
--- =============================================================================
--- Montgomery Multiplier Entity
--- =============================================================================
--- Beschreibung: 
---   Hardware-Implementierung der Montgomery-Multiplikation für große Zahlen.
---   Berechnet (A * B * R^-1) mod N mit R = 2^WIDTH.
---
--- Generics:
---   WIDTH : Bitbreite der Operanden (Standard: 1024 Bit)
---
--- Ports:
---   clk         : Systemtakt
---   reset_n     : Asynchroner Reset (aktiv low)
---   start       : Startsignal für neue Berechnung
---   read_result : Signal für Ergebnis-Zugriff (setzt done_o zurück)
---   A, B, N     : Eingangswerte für Montgomery-Multiplikation
---   S_out       : Berechnetes Ergebnis
---   done_o      : Fertig-Signal (wird nach Berechnung gesetzt)
--- =============================================================================
-
 entity montgomery_mult is
-  generic (
-    WIDTH : integer := 1024    -- Bitbreite der Operanden (Standard: 1024 Bit)
-  );
-  port (
-    -- Steuerungssignale
-    clk         : in  std_logic;                          -- Systemtakt
-    reset_n     : in  std_logic;                          -- Asynchroner Reset (aktiv low)
-    start       : in  std_logic;                          -- Startsignal für neue Berechnung
-    read_result : in  std_logic;                          -- Ergebnis-Zugriffssignal
+    generic (
+        WIDTH : integer := 1024  -- Bit width of operands (default 1024-bit for RSA)
+    );
+    port (
+        -- Clock and Reset
+        clk    : in  std_logic;  
+        reset  : in  std_logic;  --(active high)
+        
+        -- Control Interface
+        enable : in  std_logic;  -- Start computation when '1' (level-triggered)
+        done   : out std_logic;  -- Computation complete flag (stays high until enable='0')
+        
+        A      : in  std_logic_vector(WIDTH-1 downto 0);  -- Multiplicand
+        B      : in  std_logic_vector(WIDTH-1 downto 0);  -- Multiplier  
+        N      : in  std_logic_vector(WIDTH-1 downto 0);  -- Modulus (must be odd)
+        S      : out std_logic_vector(WIDTH-1 downto 0)   -- Result: S = (A*B*R^-1) mod N
+    );
+end montgomery_mult;
+
+
+architecture Behavioral of montgomery_mult is
+    -- Core computation registers
+    signal S_reg : std_logic_vector(WIDTH downto 0);     -- Extended accumulator (WIDTH+1 bits)
+    signal counter : integer range 0 to WIDTH;           -- Bit index counter (0 to WIDTH-1)
     
-    -- Dateneingänge
-    A           : in  std_logic_vector(WIDTH-1 downto 0); -- Multiplikand
-    B           : in  std_logic_vector(WIDTH-1 downto 0); -- Multiplikator
-    N           : in  std_logic_vector(WIDTH-1 downto 0); -- Modulus
+    -- Input registers for stable computation
+    signal A_reg : std_logic_vector(WIDTH-1 downto 0);   -- Registered multiplicand
+    signal B_reg : std_logic_vector(WIDTH-1 downto 0);   -- Registered multiplier
+    signal N_reg : std_logic_vector(WIDTH-1 downto 0);   -- Registered modulus
     
-    -- Datenausgänge
-    S_out       : out std_logic_vector(WIDTH-1 downto 0); -- Berechnetes Ergebnis
-    done_o      : out std_logic                           -- Fertig-Signal
-  );
-end entity montgomery_mult;
-
--- =============================================================================
--- Montgomery Multiplier Architecture
--- =============================================================================
--- Implementierung des Montgomery-Algorithmus:
---   1. IDLE:     Warten auf Startsignal
---   2. CALC:     WIDTH Iterationen des Montgomery-Algorithmus
---   3. REDUCE:   Finale Modulo-Reduktion falls S >= N
---   4. FINISHED: Ergebnis bereit, warten auf read_result
--- =============================================================================
-
-architecture rtl of montgomery_mult is
-  
-  -- Zustandsmaschine für Montgomery-Algorithmus
-  type state_type is (IDLE, CALC, REDUCE, FINISHED);
-  signal state : state_type := IDLE;
-
-  -- Interne Register für Operanden und Zwischenergebnisse
-  signal A_reg    : unsigned(WIDTH-1 downto 0) := (others => '0');  -- Multiplikand-Register
-  signal B_reg    : unsigned(WIDTH-1 downto 0) := (others => '0');  -- Multiplikator-Register
-  signal N_reg    : unsigned(WIDTH-1 downto 0) := (others => '0');  -- Modulus-Register
-  signal S_reg    : unsigned(WIDTH-1 downto 0) := (others => '0');  -- Ergebnis-Register
-  
-  -- Steuerungsregister
-  signal counter  : integer range 0 to WIDTH := 0;                  -- Iterations-Zähler
-  signal qi       : std_logic := '0';                               -- Montgomery-Quotient
-  signal done_reg : std_logic := '0';                               -- Internes done-Signal
-
+    -- Intermediate calculation signals
+    signal qi : std_logic;                                -- Quotient bit for Montgomery reduction
+    signal temp_sum : std_logic_vector(WIDTH+1 downto 0); -- Temporary sum for additions
+    
+    -- State machine for sequential computation
+    type state_type is (IDLE, INIT, COMPUTE, FINAL_SUB, FINISHED);
+    signal state : state_type;
+    
+    -- Enable edge detection for reliable start trigger (FPGA optimization)
+    signal enable_prev : std_logic := '0';               -- Previous enable state
+    signal enable_edge : std_logic := '0';               -- Rising edge detection
+    
+    -- Input change detection for automatic restart capability
+    signal A_prev : std_logic_vector(WIDTH-1 downto 0) := (others => '0');
+    signal B_prev : std_logic_vector(WIDTH-1 downto 0) := (others => '0');
+    signal N_prev : std_logic_vector(WIDTH-1 downto 0) := (others => '0');
+    signal inputs_changed : std_logic := '0';
+    
 begin
-  
-  -- Ausgangssignale
-  S_out  <= std_logic_vector(S_reg);
-  done_o <= done_reg;
-
-  -- ==========================================================================
-  -- Montgomery Multiplier Main Process
-  -- ==========================================================================
-  -- Implementiert den Montgomery-Algorithmus als Zustandsmaschine:
-  --   S = (A * B * R^-1) mod N, wobei R = 2^WIDTH
-  -- ==========================================================================
-  
-  montgomery_proc: process(clk, reset_n)
-    -- Lokale Variablen für Montgomery-Iteration
-    variable y_var : unsigned(WIDTH-1 downto 0);  -- Bedingte Addition von B
-    variable z_var : unsigned(WIDTH-1 downto 0);  -- Bedingte Addition von N
-    variable t_var : unsigned(WIDTH downto 0);    -- Zwischenergebnis (um 1 Bit erweitert)
-  begin
+    enable_edge <= enable and not enable_prev;
     
-    -- Asynchroner Reset
-    if reset_n = '0' then
-      state    <= IDLE;
-      S_reg    <= (others => '0');
-      counter  <= 0;
-      done_reg <= '0';
-      A_reg    <= (others => '0');
-      B_reg    <= (others => '0');
-      N_reg    <= (others => '0');
-      qi       <= '0';
+    inputs_changed <= '1' when (A /= A_prev or B /= B_prev or N /= N_prev) else '0';
 
-    elsif rising_edge(clk) then
-      
-      case state is
+    qi <= S_reg(0) xor (A_reg(counter) and B_reg(0));
+    
+    -- S = (S + A[i]*B + qi*N) / 2
+    temp_sum <= std_logic_vector(unsigned('0' & S_reg) + unsigned('0' & B_reg) + unsigned('0' & N_reg)) when (A_reg(counter) = '1' and qi = '1') else
+                std_logic_vector(unsigned('0' & S_reg) + unsigned('0' & B_reg)) when (A_reg(counter) = '1' and qi = '0') else
+                std_logic_vector(unsigned('0' & S_reg) + unsigned('0' & N_reg)) when (A_reg(counter) = '0' and qi = '1') else
+                '0' & S_reg;  -- No addition needed
 
-        -- =====================================================================
-        -- IDLE: Warten auf Startsignal
-        -- =====================================================================
-        when IDLE =>
-          done_reg <= '0';                          -- done-Signal zurücksetzen
-          
-          if start = '1' then
-            -- Eingangswerte in interne Register übernehmen
-            A_reg   <= unsigned(A);
-            B_reg   <= unsigned(B);
-            N_reg   <= unsigned(N);
-            S_reg   <= (others => '0');             -- Ergebnis-Register initialisieren
-            counter <= 0;                           -- Iterations-Zähler zurücksetzen
-            state   <= CALC;                        -- Übergang zu Berechnungsphase
-          end if;
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            S_reg <= (others => '0');
+            counter <= 0;
+            done <= '0';
+            state <= IDLE;
+            A_reg <= (others => '0');
+            B_reg <= (others => '0');
+            N_reg <= (others => '0');
+            enable_prev <= '0';
+            A_prev <= (others => '0');
+            B_prev <= (others => '0');
+            N_prev <= (others => '0');
+            
+        elsif rising_edge(clk) then
+            enable_prev <= enable;
+            A_prev <= A;
+            B_prev <= B;
+            N_prev <= N;
+            
+            case state is
+                when IDLE =>
+                    done <= '0';
+                    if enable = '1' then
+                        A_reg <= A;
+                        B_reg <= B;
+                        N_reg <= N;
+                        state <= INIT;
+                    end if;
+                    
+                when INIT =>
+                    S_reg <= (others => '0');
+                    counter <= 0;
+                    state <= COMPUTE;
+                    
+                when COMPUTE =>
+                    -- S = (S + A[i]*B + qi*N) / 2  (division by 2 = right shift)
+                    S_reg <= temp_sum(WIDTH+1 downto 1);
 
-        -- =====================================================================
-        -- CALC: Montgomery-Iterationen (WIDTH Durchläufe)
-        -- =====================================================================
-        when CALC =>
-          -- Bedingte Addition von B basierend auf LSB von A
-          if A_reg(0) = '1' then 
-            y_var := B_reg; 
-          else 
-            y_var := (others => '0'); 
-          end if;
-          
-          -- Montgomery-Quotient berechnen: qi = S[0] XOR (A[0] AND B[0])
-          qi <= S_reg(0) xor (A_reg(0) and B_reg(0));
-          
-          -- Bedingte Addition von N basierend auf Montgomery-Quotient
-          if qi = '1' then 
-            z_var := N_reg; 
-          else 
-            z_var := (others => '0'); 
-          end if;
-          
-          -- Montgomery-Schritt: t = S + y + z
-          t_var := ('0' & S_reg) + y_var + z_var;
-          
-          -- Rechtsshift um 1 Bit: S = t / 2
-          S_reg <= t_var(WIDTH downto 1);
-          
-          -- Rechtsshift von A um 1 Bit
-          A_reg <= '0' & A_reg(WIDTH-1 downto 1);
-          
-          -- Iterations-Zähler incrementieren
-          counter <= counter + 1;
-          
-          -- Nach WIDTH Iterationen zur Reduktionsphase
-          if counter = WIDTH-1 then
-            state <= REDUCE;
-          end if;
+                    if counter = WIDTH-1 then
+                        state <= FINAL_SUB;
+                    else
+                        counter <= counter + 1;
+                    end if;
+                    
+                when FINAL_SUB =>
+                    -- Final conditional subtraction: if S >= N then S = S - N
+                    -- This ensures result is in range [0, N-1]
+                    if unsigned(S_reg(WIDTH-1 downto 0)) >= unsigned(N_reg) then
+                        S_reg(WIDTH-1 downto 0) <= std_logic_vector(unsigned(S_reg(WIDTH-1 downto 0)) - unsigned(N_reg));
+                    end if;
+                    state <= FINISHED;
+                    
+                when FINISHED =>
+                    done <= '1';
+                    if enable = '0' then
+                        state <= IDLE;
+                    end if;
+                    
+                when others =>
+                    -- Safety catch for undefined states
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
 
-        -- =====================================================================
-        -- REDUCE: Finale Modulo-Reduktion
-        -- =====================================================================
-        when REDUCE =>
-          -- Falls S >= N, dann S = S - N
-          if S_reg >= N_reg then
-            S_reg <= S_reg - N_reg;
-          end if;
-          state <= FINISHED;
+    S <= S_reg(WIDTH-1 downto 0);
 
-        -- =====================================================================
-        -- FINISHED: Ergebnis bereit, warten auf Zugriff
-        -- =====================================================================
-        when FINISHED =>
-          done_reg <= '1';                          -- Fertig-Signal setzen
-          
-          -- Ergebnis-Zugriff: done-Signal zurücksetzen und zu IDLE
-          if read_result = '1' then
-            done_reg <= '0';
-            state    <= IDLE;
-          end if;
+end Behavioral;
 
-      end case;
-    end if;
-  end process montgomery_proc;
-  
-end architecture rtl;
